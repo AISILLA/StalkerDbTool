@@ -275,26 +275,32 @@ jobs:
               }
 
               fun decodeHeader(rawChunk: ByteArray): ByteArray {
-                  val attempts = mutableListOf<ByteArray>()
-                  attempts.add(decryptGsc(rawChunk, 0x131a9d3L, 20042299L, 0x0518443bL))
-                  attempts.add(decryptGsc(rawChunk, 0x01622731L, 25178309L, 0x0198812dL))
-                  attempts.add(rawChunk)
+                  val candidates = mutableListOf<ByteArray>()
+                  candidates.add(rawChunk)
+                  candidates.add(decryptGsc(rawChunk, 0x131a9d3L, 20042299L, 0x0518443bL))
+                  candidates.add(decryptGsc(rawChunk, 0x01622731L, 25178309L, 0x0198812dL))
 
-                  for (buf in attempts) {
+                  for (buf in candidates) {
                       if (buf.size >= 9 && (buf[0].toInt() and 0xFF) == 0xC8) {
                           runCatching {
                               val dec = decompressLzHuff(buf)
-                              if (parseEntries(dec).size > 2) return dec
+                              val parsed = parseEntries(dec)
+                              if (parsed.isNotEmpty()) return dec
                           }
                       }
-                      for (sz in listOf(4 * 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024)) {
+
+                      for (sz in listOf(2 * 1024 * 1024, 8 * 1024 * 1024, 24 * 1024 * 1024, 64 * 1024 * 1024)) {
                           runCatching {
                               val dec = decompressLzo1xSafe(buf, sz)
-                              if (parseEntries(dec).size > 2) return dec
+                              val parsed = parseEntries(dec)
+                              if (parsed.isNotEmpty()) return dec
                           }
                       }
-                      if (parseEntries(buf).size > 2) return buf
+
+                      val parsed = parseEntries(buf)
+                      if (parsed.isNotEmpty()) return buf
                   }
+
                   return rawChunk
               }
 
@@ -314,8 +320,8 @@ jobs:
                       val remaining = entrySize - 14
 
                       val candOffset = buf.int.toLong() and 0xFFFFFFFFL
-                      val path: String
-                      val offset: Long
+                      var path = ""
+                      var offset = 0L
 
                       if (candOffset >= 0L && remaining > 4 && buf.remaining() >= remaining - 4) {
                           val nameLen = remaining - 4
@@ -337,7 +343,7 @@ jobs:
                           }
                       }
 
-                      if (path.isNotBlank() && path.any { it.isLetter() } && path.all { it.code in 32..126 || it.code in 1040..1103 || it == '/' || it == '\\' || it == '.' || it == '_' || it == '-' }) {
+                      if (path.length in 3..260 && path.any { it.isLetter() }) {
                           list.add(DbFileEntry(path, sizeReal, sizeComp, crc, offset))
                       }
                   }
@@ -350,8 +356,7 @@ jobs:
                           ((b[offset + 2].toInt() and 0xFF) shl 8) or
                           (b[offset + 3].toInt() and 0xFF)
               }
-
-              fun decompressLzHuff(src: ByteArray): ByteArray {
+                            fun decompressLzHuff(src: ByteArray): ByteArray {
                   if (src.size < 9) return src
                   var srcPos = 0
                   val method = src[srcPos++].toInt() and 0xFF
@@ -549,6 +554,7 @@ jobs:
                   }
                   return lzOut
               }
+
               fun decompressLzo1xSafe(src: ByteArray, maxDestSize: Int): ByteArray {
                   val out = ByteArray(maxDestSize)
                   var ip = 0
@@ -681,8 +687,7 @@ jobs:
                   return out.copyOf(op)
               }
           }
-
-          class XRayDbArchiver {
+                    class XRayDbArchiver {
               companion object {
                   const val CHUNK_DATA = 0
                   const val CHUNK_HEADER = 1
@@ -715,7 +720,7 @@ jobs:
                           raf.seek(8L + c0Size)
                           val c1Id = readUint32LE(raf) and 0x7FFFFFFFL
                           val c1Size = readUint32LE(raf)
-                          if (c1Id == 1L && c1Size > 0 && c1Size <= (len - (8L + c0Size + 8L))) {
+                          if (c1Id == 1L && c1Size > 0) {
                               val raw = ByteArray(c1Size.toInt())
                               raf.readFully(raw)
                               val parsed = XRayCompression.parseEntries(XRayCompression.decodeHeader(raw))
@@ -728,12 +733,13 @@ jobs:
                           raf.seek(pos)
                           val cId = readUint32LE(raf) and 0x7FFFFFFFL
                           val cSize = readUint32LE(raf)
-                          if (cId == 1L && cSize in 16L..(len - pos - 8L)) {
+                          if (cId == 1L && cSize in 8L..(len - pos - 8L)) {
                               val raw = ByteArray(cSize.toInt())
                               raf.readFully(raw)
                               val parsed = XRayCompression.parseEntries(XRayCompression.decodeHeader(raw))
                               if (parsed.isNotEmpty()) return parsed
                           }
+                          if (cSize <= 0) break
                           pos += 8L + cSize
                       }
 
@@ -1277,121 +1283,4 @@ jobs:
                               TextButton(onClick = onDismiss) { Text("Закрыть") }
                           }
 
-                          Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                              OutlinedTextField(value = findQuery, onValueChange = { findQuery = it }, label = { Text("Найти в файле") }, singleLine = true, modifier = Modifier.weight(1f))
-                              FilledTonalButton(onClick = {
-                                  if (findQuery.isNotEmpty()) {
-                                      val startPos = (textFieldValue.selection.end).coerceAtLeast(0)
-                                      val text = textFieldValue.text
-                                      var foundIdx = text.indexOf(findQuery, startPos, ignoreCase = true)
-                                      if (foundIdx == -1 && startPos > 0) foundIdx = text.indexOf(findQuery, 0, ignoreCase = true)
-                                      if (foundIdx != -1) textFieldValue = textFieldValue.copy(selection = TextRange(foundIdx, foundIdx + findQuery.length))
-                                  }
-                              }) { Text("Найти") }
-                          }
-
-                          Row(modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                              quickSymbols.forEach { sym ->
-                                  AssistChip(onClick = {
-                                      val cur = textFieldValue.text
-                                      val start = textFieldValue.selection.start.coerceIn(0, cur.length)
-                                      val end = textFieldValue.selection.end.coerceIn(0, cur.length)
-                                      textFieldValue = TextFieldValue(text = cur.substring(0, start) + sym + cur.substring(end), selection = TextRange(start + sym.length))
-                                  }, label = { Text(sym, fontFamily = FontFamily.Monospace) })
-                              }
-                          }
-
-                          OutlinedTextField(
-                              value = textFieldValue,
-                              onValueChange = { textFieldValue = it },
-                              textStyle = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp),
-                              modifier = Modifier.fillMaxWidth().weight(1f)
-                          )
-
-                          Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                              OutlinedButton(onClick = { onSaveToGamedata(textFieldValue.text) }, modifier = Modifier.weight(1f)) { Text("В gamedata") }
-                              Button(onClick = { onSaveToArchive(textFieldValue.text) }, modifier = Modifier.weight(1f)) { Text("Вшить в .db") }
-                          }
-                      }
-                  }
-              }
-          }
-
-          @Composable
-          fun FullUnpackPackTab(archiver: XRayDbArchiver, archivePath: String, folderPath: String) {
-              val context = LocalContext.current
-              val scope = rememberCoroutineScope()
-              var isWorking by remember { mutableStateOf(false) }
-              var progress by remember { mutableFloatStateOf(0f) }
-              var statusText by remember { mutableStateOf("Готов к полной распаковке или сборке архива") }
-
-              Column(modifier = Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                  Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                      Button(onClick = {
-                          isWorking = true
-                          scope.launch {
-                              runCatching {
-                                  withContext(Dispatchers.IO) {
-                                      archiver.unpackArchive(File(archivePath), File(folderPath)) { cur, total, name ->
-                                          progress = cur.toFloat() / total.toFloat()
-                                          statusText = "Распаковка ($cur/$total): $name"
-                                      }
-                                  }
-                              }.onSuccess {
-                                  statusText = "Успешно распаковано!"
-                                  Toast.makeText(context, "Архив полностью распакован!", Toast.LENGTH_SHORT).show()
-                              }.onFailure {
-                                  statusText = "Ошибка: ${it.localizedMessage}"
-                                  Toast.makeText(context, "Ошибка: ${it.localizedMessage}", Toast.LENGTH_LONG).show()
-                              }
-                              isWorking = false
-                          }
-                      }, modifier = Modifier.weight(1f), enabled = !isWorking) { Text("Распаковать всё") }
-
-                      Button(onClick = {
-                          isWorking = true
-                          scope.launch {
-                              runCatching {
-                                  withContext(Dispatchers.IO) {
-                                      archiver.packDirectory(File(folderPath), File(archivePath)) { cur, total, name ->
-                                          progress = cur.toFloat() / total.toFloat()
-                                          statusText = "Упаковка ($cur/$total): $name"
-                                      }
-                                  }
-                              }.onSuccess {
-                                  statusText = "Архив успешно собран!"
-                                  Toast.makeText(context, "Архив собран: $archivePath", Toast.LENGTH_SHORT).show()
-                              }.onFailure {
-                                  statusText = "Ошибка: ${it.localizedMessage}"
-                                  Toast.makeText(context, "Ошибка: ${it.localizedMessage}", Toast.LENGTH_LONG).show()
-                              }
-                              isWorking = false
-                          }
-                      }, modifier = Modifier.weight(1f), enabled = !isWorking) { Text("Запаковать папку") }
-                  }
-
-                  if (isWorking) LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
-                  Text(text = statusText, style = MaterialTheme.typography.bodyMedium)
-              }
-          }
-          EOF
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: '8.7'
-
-      - name: Build Debug APK
-        run: gradle assembleDebug
-
-      - name: Upload Compiled APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: stalker-db-tool-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+                          Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horiz
