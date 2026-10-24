@@ -185,8 +185,7 @@ jobs:
               </application>
           </manifest>
           EOF
-
-          cat << 'EOF' > app/src/main/java/com/stalker/dbtool/MainActivity.kt
+                    cat << 'EOF' > app/src/main/java/com/stalker/dbtool/MainActivity.kt
           package com.stalker.dbtool
 
           import android.content.Context
@@ -276,43 +275,73 @@ jobs:
               }
 
               fun decodeHeader(rawChunk: ByteArray): ByteArray {
-                  val attempts = listOf(
-                      decryptGsc(rawChunk, 0x131a9d3L, 20042299L, 0x0518443bL),
-                      decryptGsc(rawChunk, 0x01622731L, 25178309L, 0x0198812dL),
-                      rawChunk
-                  )
+                  val attempts = mutableListOf<ByteArray>()
+                  attempts.add(decryptGsc(rawChunk, 0x131a9d3L, 20042299L, 0x0518443bL))
+                  attempts.add(decryptGsc(rawChunk, 0x01622731L, 25178309L, 0x0198812dL))
+                  attempts.add(rawChunk)
 
                   for (buf in attempts) {
                       if (buf.size >= 9 && (buf[0].toInt() and 0xFF) == 0xC8) {
                           runCatching {
-                              val decomp = decompressLzHuff(buf)
-                              if (isValidToc(decomp)) return decomp
+                              val dec = decompressLzHuff(buf)
+                              if (parseEntries(dec).size > 2) return dec
                           }
                       }
-
                       for (sz in listOf(4 * 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024)) {
                           runCatching {
-                              val decomp = decompressLzo1xSafe(buf, sz)
-                              if (isValidToc(decomp)) return decomp
+                              val dec = decompressLzo1xSafe(buf, sz)
+                              if (parseEntries(dec).size > 2) return dec
                           }
                       }
-
-                      if (isValidToc(buf)) return buf
+                      if (parseEntries(buf).size > 2) return buf
                   }
-
                   return rawChunk
               }
 
-              fun isValidToc(b: ByteArray): Boolean {
-                  if (b.size < 20) return false
-                  val buffer = ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN)
-                  val entrySize = buffer.short.toInt() and 0xFFFF
-                  if (entrySize !in 16..1024) return false
+              fun parseEntries(b: ByteArray): List<DbFileEntry> {
+                  val list = mutableListOf<DbFileEntry>()
+                  if (b.size < 20) return list
+                  val buf = ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN)
 
-                  buffer.position(2 + 16)
-                  if (buffer.remaining() < 1) return false
-                  val firstChar = buffer.get().toInt() and 0xFF
-                  return firstChar in 32..126
+                  while (buf.remaining() >= 18) {
+                      val start = buf.position()
+                      val entrySize = buf.short.toInt() and 0xFFFF
+                      if (entrySize < 16 || buf.remaining() < (entrySize - 2)) break
+
+                      val sizeReal = buf.int.toLong() and 0xFFFFFFFFL
+                      val sizeComp = buf.int.toLong() and 0xFFFFFFFFL
+                      val crc = buf.int.toLong() and 0xFFFFFFFFL
+                      val remaining = entrySize - 14
+
+                      val candOffset = buf.int.toLong() and 0xFFFFFFFFL
+                      val path: String
+                      val offset: Long
+
+                      if (candOffset >= 0L && remaining > 4 && buf.remaining() >= remaining - 4) {
+                          val nameLen = remaining - 4
+                          val nameBytes = ByteArray(nameLen)
+                          buf.get(nameBytes)
+                          path = String(nameBytes, Charset.forName("windows-1251")).trimEnd('\u0000').replace('\\', File.separatorChar)
+                          offset = candOffset
+                      } else {
+                          buf.position(start + 2 + 12)
+                          val nameLen = remaining - 4
+                          if (nameLen > 0 && buf.remaining() >= nameLen + 4) {
+                              val nameBytes = ByteArray(nameLen)
+                              buf.get(nameBytes)
+                              path = String(nameBytes, Charset.forName("windows-1251")).trimEnd('\u0000').replace('\\', File.separatorChar)
+                              offset = buf.int.toLong() and 0xFFFFFFFFL
+                          } else {
+                              buf.position(start + 2 + entrySize)
+                              continue
+                          }
+                      }
+
+                      if (path.isNotBlank() && path.any { it.isLetter() } && path.all { it.code in 32..126 || it.code in 1040..1103 || it == '/' || it == '\\' || it == '.' || it == '_' || it == '-' }) {
+                          list.add(DbFileEntry(path, sizeReal, sizeComp, crc, offset))
+                      }
+                  }
+                  return list
               }
 
               fun readIntBE(b: ByteArray, offset: Int): Int {
@@ -657,8 +686,6 @@ jobs:
               companion object {
                   const val CHUNK_DATA = 0
                   const val CHUNK_HEADER = 1
-                  const val CFS_COMPRESS_MARK = 0x80000000L
-                  val CP1251: Charset = Charset.forName("windows-1251")
 
                   fun readUint32LE(raf: RandomAccessFile): Long {
                       val b1 = raf.read() and 0xFF
@@ -677,76 +704,41 @@ jobs:
               }
 
               fun readArchiveIndex(dbFile: File): List<DbFileEntry> {
-                  val entries = mutableListOf<DbFileEntry>()
                   RandomAccessFile(dbFile, "r").use { raf ->
-                      val fileLength = raf.length()
-                      var headerBytes: ByteArray? = null
-
-                      while (raf.filePointer + 8L <= fileLength) {
-                          val chunkIdRaw = readUint32LE(raf)
-                          val chunkSize = readUint32LE(raf)
-                          val isCompressed = (chunkIdRaw and CFS_COMPRESS_MARK) != 0L
-                          val chunkId = (chunkIdRaw and 0x7FFFFFFFL).toInt()
-
-                          if (chunkId == CHUNK_HEADER) {
-                              val rawChunk = ByteArray(chunkSize.toInt())
-                              raf.readFully(rawChunk)
-                              headerBytes = XRayCompression.decodeHeader(rawChunk)
-                              break
-                          } else {
-                              raf.seek(raf.filePointer + chunkSize)
+                      val len = raf.length()
+                      
+                      raf.seek(0)
+                      val c0Id = readUint32LE(raf) and 0x7FFFFFFFL
+                      val c0Size = readUint32LE(raf)
+                      
+                      if (c0Id == 0L && 8L + c0Size + 8L <= len) {
+                          raf.seek(8L + c0Size)
+                          val c1Id = readUint32LE(raf) and 0x7FFFFFFFL
+                          val c1Size = readUint32LE(raf)
+                          if (c1Id == 1L && c1Size > 0 && c1Size <= (len - (8L + c0Size + 8L))) {
+                              val raw = ByteArray(c1Size.toInt())
+                              raf.readFully(raw)
+                              val parsed = XRayCompression.parseEntries(XRayCompression.decodeHeader(raw))
+                              if (parsed.isNotEmpty()) return parsed
                           }
                       }
 
-                      val hdr = headerBytes ?: throw IllegalArgumentException("Чанк оглавления (ID=1) не найден")
-                      val buffer = ByteBuffer.wrap(hdr).order(ByteOrder.LITTLE_ENDIAN)
-
-                      while (buffer.remaining() >= 18) {
-                          val entryStart = buffer.position()
-                          val entrySize = buffer.short.toInt() and 0xFFFF
-                          if (entrySize < 16 || buffer.remaining() < (entrySize - 2)) break
-
-                          val sizeReal = buffer.int.toLong() and 0xFFFFFFFFL
-                          val sizeComp = buffer.int.toLong() and 0xFFFFFFFFL
-                          val crc = buffer.int.toLong() and 0xFFFFFFFFL
-
-                          val remainingEntry = entrySize - 14
-                          val candidateOffset = buffer.int.toLong() and 0xFFFFFFFFL
-
-                          val path: String
-                          val finalOffset: Long
-
-                          if (candidateOffset in 8L..fileLength) {
-                              val nameLen = remainingEntry - 4
-                              if (nameLen > 0 && buffer.remaining() >= nameLen) {
-                                  val nameBytes = ByteArray(nameLen)
-                                  buffer.get(nameBytes)
-                                  path = String(nameBytes, CP1251).trimEnd('\u0000').replace('\\', File.separatorChar)
-                                  finalOffset = candidateOffset
-                              } else {
-                                  buffer.position(entryStart + 2 + entrySize)
-                                  continue
-                              }
-                          } else {
-                              buffer.position(entryStart + 2 + 12)
-                              val nameLen = remainingEntry - 4
-                              if (nameLen > 0 && buffer.remaining() >= nameLen + 4) {
-                                  val nameBytes = ByteArray(nameLen)
-                                  buffer.get(nameBytes)
-                                  path = String(nameBytes, CP1251).trimEnd('\u0000').replace('\\', File.separatorChar)
-                                  finalOffset = buffer.int.toLong() and 0xFFFFFFFFL
-                              } else {
-                                  buffer.position(entryStart + 2 + entrySize)
-                                  continue
-                              }
+                      var pos = 0L
+                      while (pos + 8L <= len) {
+                          raf.seek(pos)
+                          val cId = readUint32LE(raf) and 0x7FFFFFFFL
+                          val cSize = readUint32LE(raf)
+                          if (cId == 1L && cSize in 16L..(len - pos - 8L)) {
+                              val raw = ByteArray(cSize.toInt())
+                              raf.readFully(raw)
+                              val parsed = XRayCompression.parseEntries(XRayCompression.decodeHeader(raw))
+                              if (parsed.isNotEmpty()) return parsed
                           }
-
-                          if (path.isNotBlank() && path.any { it.isLetter() }) {
-                              entries.add(DbFileEntry(path, sizeReal, sizeComp, crc, finalOffset))
-                          }
+                          pos += 8L + cSize
                       }
+
+                      throw IllegalArgumentException("Оглавление архива не распознано")
                   }
-                  return entries
               }
 
               fun unpackArchive(dbFile: File, outputDir: File, onProgress: (Int, Int, String) -> Unit) {
@@ -756,10 +748,7 @@ jobs:
 
               fun extractSingleEntry(dbFile: File, entry: DbFileEntry, outputDir: File): File {
                   val outFile = File(outputDir, entry.relativePath)
-                  val parent = outFile.parentFile
-                  if (parent != null && !parent.exists()) {
-                      parent.mkdirs()
-                  }
+                  outFile.parentFile?.mkdirs()
                   RandomAccessFile(dbFile, "r").use { raf ->
                       val data = readEntryBytes(raf, entry)
                       FileOutputStream(outFile).use { fos ->
@@ -782,10 +771,7 @@ jobs:
                           val entry = sortedEntries[i]
                           onProgress(i + 1, sortedEntries.size, entry.relativePath)
                           val outFile = File(outputDir, entry.relativePath)
-                          val parent = outFile.parentFile
-                          if (parent != null && !parent.exists()) {
-                              parent.mkdirs()
-                          }
+                          outFile.parentFile?.mkdirs()
                           val data = readEntryBytes(raf, entry)
                           FileOutputStream(outFile).use { fos ->
                               fos.write(data)
@@ -798,19 +784,16 @@ jobs:
               fun readEntryAsText(dbFile: File, entry: DbFileEntry): String {
                   RandomAccessFile(dbFile, "r").use { raf ->
                       val bytes = readEntryBytes(raf, entry)
-                      return String(bytes, CP1251).replace("\r\n", "\n")
+                      return String(bytes, Charset.forName("windows-1251")).replace("\r\n", "\n")
                   }
               }
 
               fun saveTextEntryToFolder(entry: DbFileEntry, outputDir: File, newText: String): File {
                   val outFile = File(outputDir, entry.relativePath)
-                  val parent = outFile.parentFile
-                  if (parent != null && !parent.exists()) {
-                      parent.mkdirs()
-                  }
+                  outFile.parentFile?.mkdirs()
                   val normalizedText = newText.replace("\r\n", "\n").replace("\n", "\r\n")
                   FileOutputStream(outFile).use { fos ->
-                      fos.write(normalizedText.toByteArray(CP1251))
+                      fos.write(normalizedText.toByteArray(Charset.forName("windows-1251")))
                       fos.flush()
                   }
                   return outFile
@@ -819,7 +802,7 @@ jobs:
               fun updateTextEntryInArchive(dbFile: File, targetEntry: DbFileEntry, newText: String): List<DbFileEntry> {
                   val currentEntries = readArchiveIndex(dbFile)
                   val normalizedText = newText.replace("\r\n", "\n").replace("\n", "\r\n")
-                  val newBytes = normalizedText.toByteArray(CP1251)
+                  val newBytes = normalizedText.toByteArray(Charset.forName("windows-1251"))
 
                   val crc = CRC32()
                   crc.update(newBytes)
@@ -846,7 +829,7 @@ jobs:
                       val headerStream = ByteArrayOutputStream()
                       for (entry in updatedEntries) {
                           val relPathWin = entry.relativePath.replace(File.separatorChar, '\\')
-                          val nameBytes = relPathWin.toByteArray(CP1251)
+                          val nameBytes = relPathWin.toByteArray(Charset.forName("windows-1251"))
                           val entrySize = 16 + nameBytes.size
                           val entryBuf = ByteBuffer.allocate(2 + entrySize).order(ByteOrder.LITTLE_ENDIAN)
                           entryBuf.putShort(entrySize.toShort())
@@ -899,7 +882,7 @@ jobs:
                               }
                           }
 
-                          val nameBytes = relPathWin.toByteArray(CP1251)
+                          val nameBytes = relPathWin.toByteArray(Charset.forName("windows-1251"))
                           val entrySize = 16 + nameBytes.size
                           val entryBuf = ByteBuffer.allocate(2 + entrySize).order(ByteOrder.LITTLE_ENDIAN)
                           entryBuf.putShort(entrySize.toShort())
@@ -965,7 +948,7 @@ jobs:
               if (kb < 1024) return String.format(Locale.US, "%.1f КБ", kb)
               return String.format(Locale.US, "%.2f МБ", kb / 1024.0)
           }
-          class MainActivity : ComponentActivity() {
+                    class MainActivity : ComponentActivity() {
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
                   setContent {
@@ -984,7 +967,7 @@ jobs:
               val archiver = remember { XRayDbArchiver() }
 
               val defaultRoot = Environment.getExternalStorageDirectory().absolutePath
-              var archivePath by remember { mutableStateOf("$defaultRoot/Download/configs.db") }
+              var archivePath by remember { mutableStateOf("$defaultRoot/Download/EH/configs.db") }
               var folderPath by remember { mutableStateOf("$defaultRoot/Download/gamedata") }
               var selectedTab by remember { mutableIntStateOf(0) }
               val tabs = listOf("Проводник .db", "Распаковка / Сборка")
