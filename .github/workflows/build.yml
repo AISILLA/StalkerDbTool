@@ -120,8 +120,7 @@ jobs:
                   android:pathData="M54,26 A28,28 0 1,1 53.9,26 Z" />
           </vector>
           EOF
-
-          cat << 'EOF' > app/src/main/res/drawable/ic_launcher_foreground.xml
+                    cat << 'EOF' > app/src/main/res/drawable/ic_launcher_foreground.xml
           <?xml version="1.0" encoding="utf-8"?>
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
               android:width="108dp"
@@ -185,7 +184,8 @@ jobs:
               </application>
           </manifest>
           EOF
-                    cat << 'EOF' > app/src/main/java/com/stalker/dbtool/MainActivity.kt
+
+          cat << 'EOF' > app/src/main/java/com/stalker/dbtool/MainActivity.kt
           package com.stalker.dbtool
 
           import android.content.Context
@@ -243,7 +243,6 @@ jobs:
               val crc32: Long,
               val offset: Long
           )
-
           object XRayCompression {
 
               fun decryptGsc(src: ByteArray, seedInit: Long, mult: Long, add: Long): ByteArray {
@@ -285,18 +284,18 @@ jobs:
                           runCatching {
                               val dec = decompressLzHuff(buf)
                               val parsed = parseEntries(dec)
-                              if (parsed.size > 2) return dec
+                              if (parsed.isNotEmpty()) return dec
                           }
                       }
                       for (sz in listOf(4 * 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024)) {
                           runCatching {
                               val dec = decompressLzo1xSafe(buf, sz)
                               val parsed = parseEntries(dec)
-                              if (parsed.size > 2) return dec
+                              if (parsed.isNotEmpty()) return dec
                           }
                       }
                       val directParsed = parseEntries(buf)
-                      if (directParsed.size > 2) return buf
+                      if (directParsed.isNotEmpty()) return buf
                   }
                   return rawChunk
               }
@@ -304,34 +303,63 @@ jobs:
               fun parseEntries(b: ByteArray): List<DbFileEntry> {
                   val result = mutableListOf<DbFileEntry>()
                   if (b.size < 20) return result
-                  val buf = ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN)
 
-                  while (buf.remaining() >= 18) {
-                      val startPos = buf.position()
-                      val entrySize = buf.short.toInt() and 0xFFFF
-                      if (entrySize < 16 || buf.remaining() < (entrySize - 2)) break
+                  runCatching {
+                      val buf = ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN)
+                      while (buf.remaining() >= 18) {
+                          val startPos = buf.position()
+                          val entrySize = buf.short.toInt() and 0xFFFF
+                          if (entrySize < 16 || buf.remaining() < (entrySize - 2)) break
 
-                      val sizeReal = buf.int.toLong() and 0xFFFFFFFFL
-                      val sizeComp = buf.int.toLong() and 0xFFFFFFFFL
-                      val crc = buf.int.toLong() and 0xFFFFFFFFL
+                          val sizeReal = buf.int.toLong() and 0xFFFFFFFFL
+                          val sizeComp = buf.int.toLong() and 0xFFFFFFFFL
+                          val crc = buf.int.toLong() and 0xFFFFFFFFL
 
-                      // Читаем имя до нуль-терминатора
-                      val nameBytes = ByteArrayOutputStream()
-                      while (buf.hasRemaining()) {
-                          val byteVal = buf.get()
-                          if (byteVal == 0.toByte()) break
-                          nameBytes.write(byteVal.toInt())
+                          val nameBytes = ByteArrayOutputStream()
+                          while (buf.hasRemaining()) {
+                              val byteVal = buf.get()
+                              if (byteVal == 0.toByte()) break
+                              nameBytes.write(byteVal.toInt())
+                          }
+                          val path = String(nameBytes.toByteArray(), Charset.forName("windows-1251")).replace('\\', File.separatorChar)
+
+                          if (buf.remaining() >= 4) {
+                              val offset = buf.int.toLong() and 0xFFFFFFFFL
+                              if (path.length in 2..260 && path.any { it.isLetter() }) {
+                                  result.add(DbFileEntry(path, sizeReal, sizeComp, crc, offset))
+                              }
+                          }
+                          buf.position(startPos + 2 + entrySize)
                       }
-                      val path = String(nameBytes.toByteArray(), Charset.forName("windows-1251")).replace('\\', File.separatorChar)
+                  }
+                  if (result.size > 2) return result
+                  result.clear()
 
-                      if (buf.remaining() >= 4) {
+                  runCatching {
+                      val buf = ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN)
+                      while (buf.remaining() >= 20) {
+                          val startPos = buf.position()
+                          val nameBytes = ByteArrayOutputStream()
+                          var foundZero = false
+                          while (buf.hasRemaining()) {
+                              val byteVal = buf.get()
+                              if (byteVal == 0.toByte()) { foundZero = true; break }
+                              nameBytes.write(byteVal.toInt())
+                          }
+                          if (!foundZero || nameBytes.size() == 0 || buf.remaining() < 16) {
+                              buf.position(startPos + 1)
+                              continue
+                          }
+                          val path = String(nameBytes.toByteArray(), Charset.forName("windows-1251")).replace('\\', File.separatorChar)
                           val offset = buf.int.toLong() and 0xFFFFFFFFL
-                          if (path.length in 2..260 && path.any { it.isLetter() }) {
+                          val sizeReal = buf.int.toLong() and 0xFFFFFFFFL
+                          val sizeComp = buf.int.toLong() and 0xFFFFFFFFL
+                          val crc = buf.int.toLong() and 0xFFFFFFFFL
+
+                          if (path.length in 2..260 && path.any { it.isLetter() } && (path.contains("/") || path.contains("."))) {
                               result.add(DbFileEntry(path, sizeReal, sizeComp, crc, offset))
                           }
                       }
-
-                      buf.position(startPos + 2 + entrySize)
                   }
                   return result
               }
@@ -710,7 +738,7 @@ jobs:
                               val raw = ByteArray(c1Size.toInt())
                               raf.readFully(raw)
                               val parsed = XRayCompression.parseEntries(XRayCompression.decodeHeader(raw))
-                              if (parsed.size > 2) return parsed
+                              if (parsed.isNotEmpty()) return parsed
                           }
                       }
 
@@ -723,13 +751,20 @@ jobs:
                               val raw = ByteArray(cSize.toInt())
                               raf.readFully(raw)
                               val parsed = XRayCompression.parseEntries(XRayCompression.decodeHeader(raw))
-                              if (parsed.size > 2) return parsed
+                              if (parsed.isNotEmpty()) return parsed
                           }
                           if (cSize <= 0) break
                           pos += 8L + cSize
                       }
 
-                      throw IllegalArgumentException("Не удалось разобрать оглавление")
+                      val tailScanLen = minOf(len, 32L * 1024 * 1024)
+                      val tailBuf = ByteArray(tailScanLen.toInt())
+                      raf.seek(len - tailScanLen)
+                      raf.readFully(tailBuf)
+                      val parsedTail = XRayCompression.parseEntries(XRayCompression.decodeHeader(tailBuf))
+                      if (parsedTail.isNotEmpty()) return parsedTail
+
+                      throw IllegalArgumentException("Не удалось обнаружить файлы в архиве")
                   }
               }
 
@@ -1388,4 +1423,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: stalker-db-tool-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: app/build/outputs/apk/debug/app-debug.apkц
