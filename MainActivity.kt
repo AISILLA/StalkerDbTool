@@ -59,15 +59,15 @@ object XRayCompression {
     private const val SBOX_SIZE = 256
 
     fun decodeHeaderChunk(rawChunk: ByteArray): ByteArray {
-        // 1. Попытка распаковки как LZO1X (используется в большинстве .db/.xdb модов)
-        for (candidateSize in listOf(2 * 1024 * 1024, 8 * 1024 * 1024, 16 * 1024 * 1024, 32 * 1024 * 1024)) {
+        val candidateSizes = listOf(2 * 1024 * 1024, 8 * 1024 * 1024, 16 * 1024 * 1024, 32 * 1024 * 1024)
+
+        for (size in candidateSizes) {
             runCatching {
-                val out = decompressLzo1xSafe(rawChunk, candidateSize)
+                val out = decompressLzo1xSafe(rawChunk, size)
                 if (isValidIndexHeader(out)) return out
             }
         }
 
-        // 2. Попытка распаковки как прямой LZHUFF
         if (isValidLzHuff(rawChunk)) {
             runCatching {
                 val out = decompressLzHuff(rawChunk)
@@ -75,27 +75,24 @@ object XRayCompression {
             }
         }
 
-        // 3. Дешифровка GSC (RU / CS / CoP)
-        val decRu = decryptScrambler(rawChunk, initSeed = 0x131a9d3, mult = 20042299, add = 0x0518443b)
+        val decRu = decryptScrambler(rawChunk, 0x131a9d3, 20042299, 0x0518443b)
         runCatching {
             val out = if (isValidLzHuff(decRu)) decompressLzHuff(decRu) else decompressLzo1xSafe(decRu, 8 * 1024 * 1024)
             if (isValidIndexHeader(out)) return out
         }
 
-        // 4. Дешифровка GSC (WW)
-        val decWw = decryptScrambler(rawChunk, initSeed = 0x01622731, mult = 25178309, add = 0x0198812d)
+        val decWw = decryptScrambler(rawChunk, 0x01622731, 25178309, 0x0198812d)
         runCatching {
             val out = if (isValidLzHuff(decWw)) decompressLzHuff(decWw) else decompressLzo1xSafe(decWw, 8 * 1024 * 1024)
             if (isValidIndexHeader(out)) return out
         }
 
-        // Если заголовок не был сжат, возвращаем исходный блок
         return rawChunk
     }
 
     private fun isValidIndexHeader(b: ByteArray): Boolean {
         if (b.size < 18) return false
-        val entrySize = ((b[0].toInt() and 0xFF) or ((b[1].toInt() and 0xFF) shl 8))
+        val entrySize = (b[0].toInt() and 0xFF) or ((b[1].toInt() and 0xFF) shl 8)
         return entrySize in 17..2048
     }
 
@@ -475,6 +472,21 @@ class XRayDbArchiver {
         private const val CHUNK_HEADER = 1
         private const val CFS_COMPRESS_MARK = 0x80000000L
         private val CP1251: Charset = Charset.forName("windows-1251")
+
+        fun readUint32LE(raf: RandomAccessFile): Long {
+            val b1 = raf.read() and 0xFF
+            val b2 = raf.read() and 0xFF
+            val b3 = raf.read() and 0xFF
+            val b4 = raf.read() and 0xFF
+            return (b1.toLong()) or (b2.toLong() shl 8) or (b3.toLong() shl 16) or (b4.toLong() shl 24)
+        }
+
+        fun writeIntLE(raf: RandomAccessFile, value: Int) {
+            raf.write(value and 0xFF)
+            raf.write((value ushr 8) and 0xFF)
+            raf.write((value ushr 16) and 0xFF)
+            raf.write((value ushr 24) and 0xFF)
+        }
     }
 
     fun readArchiveIndex(dbFile: File): List<DbFileEntry> {
@@ -483,9 +495,9 @@ class XRayDbArchiver {
             val fileLength = raf.length()
             var headerBytes: ByteArray? = null
 
-            while (raf.filePointer + 8 <= fileLength) {
-                val chunkIdRaw = raf.readUint32LE()
-                val chunkSize = raf.readUint32LE()
+            while (raf.filePointer + 8L <= fileLength) {
+                val chunkIdRaw = readUint32LE(raf)
+                val chunkSize = readUint32LE(raf)
                 val isCompressed = (chunkIdRaw and CFS_COMPRESS_MARK) != 0L
                 val chunkId = (chunkIdRaw and 0x7FFFFFFFL).toInt()
 
@@ -536,7 +548,12 @@ class XRayDbArchiver {
         outFile.parentFile?.mkdirs()
         RandomAccessFile(dbFile, "r").use { raf ->
             val data = readRawOrDecompressedEntry(raf, entry)
-            FileOutputStream(outFile).use { it.write(data) }
+            val fos = FileOutputStream(outFile)
+            try {
+                fos.write(data)
+            } finally {
+                fos.close()
+            }
         }
         return outFile
     }
@@ -546,14 +563,4 @@ class XRayDbArchiver {
         RandomAccessFile(dbFile, "r").use { raf ->
             sortedEntries.forEachIndexed { index, entry ->
                 onProgress(index + 1, sortedEntries.size, entry.relativePath)
-                val outFile = File(outputDir, entry.relativePath)
-                outFile.parentFile?.mkdirs()
-                val data = readRawOrDecompressedEntry(raf, entry)
-                FileOutputStream(outFile).use { it.write(data) }
-            }
-        }
-    }
-
-    fun readEntryAsText(dbFile: File, entry: DbFileEntry): String {
-        RandomAccessFile(dbFile, "r").use { raf ->
-            val bytes = readRawOrDecompressedEntry(raf, 
+                val outFile = File(outputDir, entry.relativePat
