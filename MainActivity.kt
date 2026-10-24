@@ -7,6 +7,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -330,7 +331,7 @@ object XRayCompression {
         }
         return lzOut
     }
-    fun decompressLzo1xSafe(src: ByteArray, maxDestSize: Int): ByteArray {
+        fun decompressLzo1xSafe(src: ByteArray, maxDestSize: Int): ByteArray {
         val out = ByteArray(maxDestSize)
         var ip = 0
         var op = 0
@@ -566,11 +567,15 @@ class XRayDbArchiver {
 
     fun extractSingleEntry(dbFile: File, entry: DbFileEntry, outputDir: File): File {
         val outFile = File(outputDir, entry.relativePath)
-        outFile.parentFile?.mkdirs()
+        val parent = outFile.parentFile
+        if (parent != null && !parent.exists()) {
+            parent.mkdirs()
+        }
         RandomAccessFile(dbFile, "r").use { raf ->
             val data = readEntryBytes(raf, entry)
             FileOutputStream(outFile).use { fos ->
                 fos.write(data)
+                fos.flush()
             }
         }
         return outFile
@@ -587,10 +592,14 @@ class XRayDbArchiver {
                 val entry = sortedEntries[i]
                 onProgress(i + 1, sortedEntries.size, entry.relativePath)
                 val outFile = File(outputDir, entry.relativePath)
-                outFile.parentFile?.mkdirs()
+                val parent = outFile.parentFile
+                if (parent != null && !parent.exists()) {
+                    parent.mkdirs()
+                }
                 val data = readEntryBytes(raf, entry)
                 FileOutputStream(outFile).use { fos ->
                     fos.write(data)
+                    fos.flush()
                 }
             }
         }
@@ -605,10 +614,14 @@ class XRayDbArchiver {
 
     fun saveTextEntryToFolder(entry: DbFileEntry, outputDir: File, newText: String): File {
         val outFile = File(outputDir, entry.relativePath)
-        outFile.parentFile?.mkdirs()
+        val parent = outFile.parentFile
+        if (parent != null && !parent.exists()) {
+            parent.mkdirs()
+        }
         val normalizedText = newText.replace("\r\n", "\n").replace("\n", "\r\n")
         FileOutputStream(outFile).use { fos ->
             fos.write(normalizedText.toByteArray(CP1251))
+            fos.flush()
         }
         return outFile
     }
@@ -721,7 +734,7 @@ class XRayDbArchiver {
         }
     }
 
-    fun readEntryBytes(raf: RandomAccessFile, entry: DbFileEntry): ByteArray {
+    private fun readEntryBytes(raf: RandomAccessFile, entry: DbFileEntry): ByteArray {
         if (entry.sizeReal == 0L) return ByteArray(0)
         raf.seek(entry.offset)
         val rawData = ByteArray(entry.sizeCompressed.toInt())
@@ -875,6 +888,7 @@ fun StalkerArchiverMain() {
 
 @Composable
 fun ArchiveExplorerScreen(archiver: XRayDbArchiver, archivePath: String, outputDirPath: String) {
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var allEntries by remember { mutableStateOf<List<DbFileEntry>>(emptyList()) }
     var selectedPaths by remember { mutableStateOf<Set<String>>(emptySet()) }
@@ -909,8 +923,10 @@ fun ArchiveExplorerScreen(archiver: XRayDbArchiver, archivePath: String, outputD
                         }.onSuccess { list ->
                             allEntries = list
                             statusMessage = "Файлов в архиве: ${list.size}"
+                            Toast.makeText(context, "Найдено файлов: ${list.size}", Toast.LENGTH_SHORT).show()
                         }.onFailure { e ->
                             statusMessage = "Ошибка: ${e.localizedMessage}"
+                            Toast.makeText(context, "Ошибка: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
                         }
                         isBusy = false
                     }
@@ -935,9 +951,11 @@ fun ArchiveExplorerScreen(archiver: XRayDbArchiver, archivePath: String, outputD
                                 }
                             }.onSuccess {
                                 statusMessage = "Извлечено файлов: ${toExtract.size}"
+                                Toast.makeText(context, "Успешно извлечено: ${toExtract.size} шт.", Toast.LENGTH_SHORT).show()
                                 selectedPaths = emptySet()
                             }.onFailure { e ->
                                 statusMessage = "Ошибка: ${e.localizedMessage}"
+                                Toast.makeText(context, "Ошибка: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
                             }
                             isBusy = false
                         }
@@ -993,7 +1011,10 @@ fun ArchiveExplorerScreen(archiver: XRayDbArchiver, archivePath: String, outputD
                                 }.onSuccess { text ->
                                     initialEditorText = text
                                     editingEntry = entry
-                                }.onFailure { statusMessage = "Ошибка: ${it.localizedMessage}" }
+                                }.onFailure {
+                                    statusMessage = "Ошибка: ${it.localizedMessage}"
+                                    Toast.makeText(context, "Ошибка: ${it.localizedMessage}", Toast.LENGTH_SHORT).show()
+                                }
                             }
                         } else {
                             selectedPaths = if (isChecked) selectedPaths - entry.relativePath else selectedPaths + entry.relativePath
@@ -1011,9 +1032,17 @@ fun ArchiveExplorerScreen(archiver: XRayDbArchiver, archivePath: String, outputD
                         }
                         OutlinedButton(onClick = {
                             scope.launch {
+                                isBusy = true
                                 runCatching {
                                     withContext(Dispatchers.IO) { archiver.extractSingleEntry(File(archivePath), entry, File(outputDirPath)) }
-                                }.onSuccess { statusMessage = "Сохранен: ${it.absolutePath}" }
+                                }.onSuccess { savedFile ->
+                                    statusMessage = "Сохранен: ${savedFile.absolutePath}"
+                                    Toast.makeText(context, "Извлечён: ${savedFile.name}", Toast.LENGTH_SHORT).show()
+                                }.onFailure { e ->
+                                    statusMessage = "Ошибка: ${e.localizedMessage}"
+                                    Toast.makeText(context, "Ошибка: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+                                }
+                                isBusy = false
                             }
                         }, contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)) {
                             Text("Извлечь", style = MaterialTheme.typography.labelMedium)
@@ -1033,9 +1062,12 @@ fun ArchiveExplorerScreen(archiver: XRayDbArchiver, archivePath: String, outputD
                 scope.launch {
                     runCatching {
                         withContext(Dispatchers.IO) { archiver.saveTextEntryToFolder(entry, File(outputDirPath), updatedText) }
-                    }.onSuccess {
+                    }.onSuccess { savedFile ->
                         statusMessage = "Сохранено в gamedata"
+                        Toast.makeText(context, "Сохранено: ${savedFile.name}", Toast.LENGTH_SHORT).show()
                         editingEntry = null
+                    }.onFailure {
+                        Toast.makeText(context, "Ошибка: ${it.localizedMessage}", Toast.LENGTH_LONG).show()
                     }
                 }
             },
@@ -1046,7 +1078,10 @@ fun ArchiveExplorerScreen(archiver: XRayDbArchiver, archivePath: String, outputD
                     }.onSuccess { updatedList ->
                         allEntries = updatedList
                         statusMessage = "Обновлено внутри .db архива!"
+                        Toast.makeText(context, "Обновлено внутри .db!", Toast.LENGTH_SHORT).show()
                         editingEntry = null
+                    }.onFailure {
+                        Toast.makeText(context, "Ошибка: ${it.localizedMessage}", Toast.LENGTH_LONG).show()
                     }
                 }
             }
@@ -1111,6 +1146,7 @@ fun ConfigEditorDialog(entry: DbFileEntry, initialText: String, onDismiss: () ->
 
 @Composable
 fun FullUnpackPackTab(archiver: XRayDbArchiver, archivePath: String, folderPath: String) {
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var isWorking by remember { mutableStateOf(false) }
     var progress by remember { mutableFloatStateOf(0f) }
@@ -1128,7 +1164,13 @@ fun FullUnpackPackTab(archiver: XRayDbArchiver, archivePath: String, folderPath:
                                 statusText = "Распаковка ($cur/$total): $name"
                             }
                         }
-                    }.onSuccess { statusText = "Успешно распаковано!" }.onFailure { statusText = "Ошибка: ${it.localizedMessage}" }
+                    }.onSuccess {
+                        statusText = "Успешно распаковано!"
+                        Toast.makeText(context, "Архив полностью распакован!", Toast.LENGTH_SHORT).show()
+                    }.onFailure {
+                        statusText = "Ошибка: ${it.localizedMessage}"
+                        Toast.makeText(context, "Ошибка: ${it.localizedMessage}", Toast.LENGTH_LONG).show()
+                    }
                     isWorking = false
                 }
             }, modifier = Modifier.weight(1f), enabled = !isWorking) { Text("Распаковать всё") }
@@ -1143,7 +1185,13 @@ fun FullUnpackPackTab(archiver: XRayDbArchiver, archivePath: String, folderPath:
                                 statusText = "Упаковка ($cur/$total): $name"
                             }
                         }
-                    }.onSuccess { statusText = "Архив успешно собран!" }.onFailure { statusText = "Ошибка: ${it.localizedMessage}" }
+                    }.onSuccess {
+                        statusText = "Архив успешно собран!"
+                        Toast.makeText(context, "Архив собран: $archivePath", Toast.LENGTH_SHORT).show()
+                    }.onFailure {
+                        statusText = "Ошибка: ${it.localizedMessage}"
+                        Toast.makeText(context, "Ошибка: ${it.localizedMessage}", Toast.LENGTH_LONG).show()
+                    }
                     isWorking = false
                 }
             }, modifier = Modifier.weight(1f), enabled = !isWorking) { Text("Запаковать папку") }
@@ -1152,4 +1200,4 @@ fun FullUnpackPackTab(archiver: XRayDbArchiver, archivePath: String, folderPath:
         if (isWorking) LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
         Text(text = statusText, style = MaterialTheme.typography.bodyMedium)
     }
-}
+}я
