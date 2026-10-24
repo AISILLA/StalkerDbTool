@@ -1,4 +1,5 @@
-package com.stalker.dbtool
+ shl (
+                    package com.stalker.dbtool
 
 import android.content.Context
 import android.content.Intent
@@ -57,7 +58,7 @@ data class DbFileEntry(
 
 object XRayCompression {
 
-    fun decryptGscHeader(src: ByteArray, seedInit: Long, mult: Long, add: Long): ByteArray {
+    fun decryptGsc(src: ByteArray, seedInit: Long, mult: Long, add: Long): ByteArray {
         val sbox = IntArray(256) { it }
         var seed = seedInit and 0xFFFFFFFFL
 
@@ -85,61 +86,44 @@ object XRayCompression {
         return dst
     }
 
-    fun decodeHeaderChunk(rawChunk: ByteArray): ByteArray {
-        if (isValidIndexHeader(rawChunk)) return rawChunk
+    fun decodeHeader(rawChunk: ByteArray): ByteArray {
+        val attempts = listOf(
+            decryptGsc(rawChunk, 0x131a9d3L, 20042299L, 0x0518443bL),
+            decryptGsc(rawChunk, 0x01622731L, 25178309L, 0x0198812dL),
+            rawChunk
+        )
 
-        // Проверяем снятие скремблера CoP / CS
-        val decRu = decryptGscHeader(rawChunk, 0x131a9d3L, 20042299L, 0x0518443bL)
-        if (isValidIndexHeader(decRu)) return decRu
-
-        if (isValidLzHuff(decRu)) {
-            runCatching {
-                val out = decompressLzHuff(decRu)
-                if (isValidIndexHeader(out)) return out
+        for (buf in attempts) {
+            if (buf.size >= 9 && (buf[0].toInt() and 0xFF) == 0xC8) {
+                runCatching {
+                    val decomp = decompressLzHuff(buf)
+                    if (isValidToc(decomp)) return decomp
+                }
             }
-        }
 
-        // WW версия
-        val decWw = decryptGscHeader(rawChunk, 0x01622731L, 25178309L, 0x0198812dL)
-        if (isValidIndexHeader(decWw)) return decWw
-
-        if (isValidLzHuff(decWw)) {
-            runCatching {
-                val out = decompressLzHuff(decWw)
-                if (isValidIndexHeader(out)) return out
+            for (sz in listOf(4 * 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024)) {
+                runCatching {
+                    val decomp = decompressLzo1xSafe(buf, sz)
+                    if (isValidToc(decomp)) return decomp
+                }
             }
-        }
 
-        // Чистый LZHUFF
-        if (isValidLzHuff(rawChunk)) {
-            runCatching {
-                val out = decompressLzHuff(rawChunk)
-                if (isValidIndexHeader(out)) return out
-            }
-        }
-
-        // Чистый LZO1X (с запасом под ресурсы до 64 МБ)
-        for (candidateSize in listOf(4 * 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024)) {
-            runCatching {
-                val out = decompressLzo1xSafe(rawChunk, candidateSize)
-                if (isValidIndexHeader(out)) return out
-            }
+            if (isValidToc(buf)) return buf
         }
 
         return rawChunk
     }
 
-    private fun isValidIndexHeader(b: ByteArray): Boolean {
-        if (b.size < 18) return false
-        val entrySize = (b[0].toInt() and 0xFF) or ((b[1].toInt() and 0xFF) shl 8)
-        if (entrySize !in 17..2048) return false
-        val c = b[16].toInt() and 0xFF
-        return (c in 32..126)
-    }
+    private fun isValidToc(b: ByteArray): Boolean {
+        if (b.size < 20) return false
+        val buffer = ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN)
+        val entrySize = buffer.short.toInt() and 0xFFFF
+        if (entrySize !in 16..1024) return false
 
-    private fun isValidLzHuff(data: ByteArray): Boolean {
-        if (data.size < 9) return false
-        return (data[0].toInt() and 0xFF) == 0xC8
+        buffer.position(2 + 16)
+        if (buffer.remaining() < 1) return false
+        val firstChar = buffer.get().toInt() and 0xFF
+        return firstChar in 32..126
     }
 
     private fun readIntBE(b: ByteArray, offset: Int): Int {
@@ -193,161 +177,7 @@ object XRayCompression {
         fun getBit(): Int {
             while (getlen <= 8) {
                 val c = if (srcPos < src.size) (src[srcPos++].toInt() and 0xFF) else 0
-                getbuf = getbuf or (c shl (8 - getlen))
-                getlen += 8
-            }
-            val bit = (getbuf and 0x8000) ushr 15
-            getbuf = (getbuf shl 1) and 0xFFFF
-            getlen--
-            return bit
-        }
-
-        fun getByte(): Int {
-            while (getlen <= 8) {
-                val c = if (srcPos < src.size) (src[srcPos++].toInt() and 0xFF) else 0
-                getbuf = getbuf or (c shl (8 - getlen))
-                getlen += 8
-            }
-            val byteVal = (getbuf and 0xFF00) ushr 8
-            getbuf = (getbuf shl 8) and 0xFFFF
-            getlen -= 8
-            return byteVal
-        }
-
-        fun reconst() {
-            var k = 0
-            for (m in 0 until T) {
-                if (son[m] >= T) {
-                    freq[k] = (freq[m] + 1) / 2
-                    son[k] = son[m]
-                    k++
-                }
-            }
-            var m = 0
-            for (n in N_CHAR until T) {
-                val k1 = m + 1
-                val f = freq[m] + freq[k1]
-                freq[n] = f
-                var p = n - 1
-                while (f < freq[p]) p--
-                p++
-                val copyLen = n - p
-                System.arraycopy(freq, p, freq, p + 1, copyLen)
-                freq[p] = f
-                System.arraycopy(son, p, son, p + 1, copyLen)
-                son[p] = m
-                m += 2
-            }
-            for (m2 in 0 until T) {
-                val s = son[m2]
-                if (s >= T) prnt[s] = m2
-                else {
-                    prnt[s] = m2
-                    prnt[s + 1] = m2
-                }
-            }
-        }
-
-        fun update(cParam: Int) {
-            if (freq[R] == MAX_FREQ) reconst()
-            var c = prnt[cParam + T]
-            do {
-                freq[c]++
-                val k = freq[c]
-                var l = c + 1
-                if (k > freq[l]) {
-                    while (k > freq[++l]) {}
-                    l--
-                    freq[c] = freq[l]
-                    freq[l] = k
-                    val i = son[c]
-                    prnt[i] = l
-                    if (i < T) prnt[i + 1] = l
-                    val j = son[l]
-                    son[l] = i
-                    prnt[j] = c
-                    if (j < T) prnt[j + 1] = c
-                    son[c] = j
-                    c = l
-                }
-                c = prnt[c]
-            } while (c != 0)
-        }
-
-        val dCode = IntArray(256) { idx ->
-            when {
-                idx < 0x20 -> 0
-                idx < 0x50 -> 1 + ((idx - 0x20) ushr 4)
-                idx < 0x90 -> 4 + ((idx - 0x50) ushr 3)
-                idx < 0xC0 -> 12 + ((idx - 0x90) ushr 2)
-                idx < 0xF0 -> 24 + ((idx - 0xC0) ushr 1)
-                else -> 48 + (idx - 0xF0)
-            }
-        }
-        val dLen = IntArray(256) { idx ->
-            when {
-                idx < 0x20 -> 3
-                idx < 0x50 -> 4
-                idx < 0x90 -> 5
-                idx < 0xC0 -> 6
-                idx < 0xF0 -> 7
-                else -> 8
-            }
-        }
-
-        fun decodeChar(): Int {
-            var c = son[R]
-            while (c < T) {
-                c += getBit()
-                c = son[c]
-            }
-            c -= T
-            update(c)
-            return c
-        }
-
-        fun decodePosition(): Int {
-            val i = getByte()
-            val c = dCode[i] shl 6
-            var j = dLen[i] - 2
-            var rem = i
-            while (j-- > 0) {
-                rem = (rem shl 1) + getBit()
-            }
-            return c or (rem and 0x3F)
-        }
-
-        val N_DICT = 4096
-        val F_DICT = 60
-        val THRESHOLD = 2
-        val textBuf = ByteArray(N_DICT + F_DICT - 1) { 0x20 }
-        var rDict = N_DICT - F_DICT
-
-        val lzOut = ByteArray(lzSize)
-        var lzPos = 0
-
-        while (lzPos < lzSize && srcPos <= src.size) {
-            val c = decodeChar()
-            if (c < 256) {
-                val b = c.toByte()
-                lzOut[lzPos++] = b
-                textBuf[rDict++] = b
-                rDict = rDict and (N_DICT - 1)
-            } else {
-                val matchPos = (rDict - decodePosition() - 1) and (N_DICT - 1)
-                val matchLen = c - 255 + THRESHOLD
-                for (k in 0 until matchLen) {
-                    if (lzPos >= lzSize) break
-                    val b = textBuf[(matchPos + k) and (N_DICT - 1)]
-                    lzOut[lzPos++] = b
-                    textBuf[rDict++] = b
-                    rDict = rDict and (N_DICT - 1)
-                }
-            }
-        }
-        return lzOut
-    }
-
+                getbuf = getbuf or (c shl (
     fun decompressLzo1xSafe(src: ByteArray, maxDestSize: Int): ByteArray {
         val out = ByteArray(maxDestSize)
         var ip = 0
@@ -519,7 +349,7 @@ class XRayDbArchiver {
                 if (chunkId == CHUNK_HEADER) {
                     val rawChunk = ByteArray(chunkSize.toInt())
                     raf.readFully(rawChunk)
-                    headerBytes = XRayCompression.decodeHeaderChunk(rawChunk)
+                    headerBytes = XRayCompression.decodeHeader(rawChunk)
                     break
                 } else {
                     raf.seek(raf.filePointer + chunkSize)
@@ -530,6 +360,7 @@ class XRayDbArchiver {
             val buffer = ByteBuffer.wrap(hdr).order(ByteOrder.LITTLE_ENDIAN)
 
             while (buffer.remaining() >= 18) {
+                val entryStart = buffer.position()
                 val entrySize = buffer.short.toInt() and 0xFFFF
                 if (entrySize < 16 || buffer.remaining() < (entrySize - 2)) break
 
@@ -537,16 +368,39 @@ class XRayDbArchiver {
                 val sizeComp = buffer.int.toLong() and 0xFFFFFFFFL
                 val crc = buffer.int.toLong() and 0xFFFFFFFFL
 
-                val nameLength = entrySize - 16
-                if (nameLength <= 0 || buffer.remaining() < (nameLength + 4)) break
+                val remainingEntry = entrySize - 14
+                val candidateOffset = buffer.int.toLong() and 0xFFFFFFFFL
 
-                val nameBytes = ByteArray(nameLength)
-                buffer.get(nameBytes)
-                val path = String(nameBytes, CP1251).trimEnd('\u0000').replace('\\', File.separatorChar)
-                val offset = buffer.int.toLong() and 0xFFFFFFFFL
+                val path: String
+                val finalOffset: Long
 
-                if (path.isNotBlank()) {
-                    entries.add(DbFileEntry(path, sizeReal, sizeComp, crc, offset))
+                if (candidateOffset in 8L..fileLength) {
+                    val nameLen = remainingEntry - 4
+                    if (nameLen > 0 && buffer.remaining() >= nameLen) {
+                        val nameBytes = ByteArray(nameLen)
+                        buffer.get(nameBytes)
+                        path = String(nameBytes, CP1251).trimEnd('\u0000').replace('\\', File.separatorChar)
+                        finalOffset = candidateOffset
+                    } else {
+                        buffer.position(entryStart + 2 + entrySize)
+                        continue
+                    }
+                } else {
+                    buffer.position(entryStart + 2 + 12)
+                    val nameLen = remainingEntry - 4
+                    if (nameLen > 0 && buffer.remaining() >= nameLen + 4) {
+                        val nameBytes = ByteArray(nameLen)
+                        buffer.get(nameBytes)
+                        path = String(nameBytes, CP1251).trimEnd('\u0000').replace('\\', File.separatorChar)
+                        finalOffset = buffer.int.toLong() and 0xFFFFFFFFL
+                    } else {
+                        buffer.position(entryStart + 2 + entrySize)
+                        continue
+                    }
+                }
+
+                if (path.isNotBlank() && path.any { it.isLetter() }) {
+                    entries.add(DbFileEntry(path, sizeReal, sizeComp, crc, finalOffset))
                 }
             }
         }
@@ -733,7 +587,6 @@ class XRayDbArchiver {
         }
     }
 }
-
 fun getFilePathFromUri(context: Context, uri: Uri): String? {
     val path = uri.path ?: return null
     if (path.startsWith("/external_files/")) {
@@ -1122,7 +975,7 @@ fun FullUnpackPackTab(archiver: XRayDbArchiver, archivePath: String, folderPath:
                 }
             }, modifier = Modifier.weight(1f), enabled = !isWorking) { Text("Распаковать всё") }
 
-            Button(onClick = {
+             Button(onClick = {
                 isWorking = true
                 scope.launch {
                     runCatching {
