@@ -1,5 +1,6 @@
 package com.stalker.dbtool
 
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -7,6 +8,7 @@ import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
@@ -17,7 +19,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Clear
-import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -310,7 +311,6 @@ object XRayCompression {
                 }
             }
         }
-        if (lzSize == uncompSize) return lzOut
         return lzOut
     }
 
@@ -318,7 +318,7 @@ object XRayCompression {
         val dst = ByteArray(realSize)
         var ip = 0
         var op = 0
-        var t: Int
+        var t = 0
 
         fun copyMatch(mPosStart: Int, count: Int) {
             var m = mPosStart
@@ -344,8 +344,7 @@ object XRayCompression {
         outer@ while (true) {
             if (!gtFirstLiteralRun) {
                 t = src[ip++].toInt() and 0xFF
-                if (t >= 16) {
-                } else {
+                if (t < 16) {
                     if (t == 0) {
                         while (src[ip].toInt() == 0) {
                             t += 255
@@ -674,6 +673,23 @@ class XRayDbArchiver {
     }
 }
 
+fun getFilePathFromUri(context: Context, uri: Uri): String? {
+    val path = uri.path ?: return null
+    if (path.startsWith("/external_files/")) {
+        return Environment.getExternalStorageDirectory().absolutePath + path.removePrefix("/external_files")
+    }
+    if (path.contains("/document/primary:")) {
+        val subPath = path.substringAfter("primary:")
+        return Environment.getExternalStorageDirectory().absolutePath + "/" + subPath.replace("%2F", "/")
+    }
+    if (path.contains("/tree/primary:")) {
+        val subPath = path.substringAfter("primary:")
+        return Environment.getExternalStorageDirectory().absolutePath + "/" + subPath.replace("%2F", "/")
+    }
+    if (path.startsWith("/")) return path
+    return Environment.getExternalStorageDirectory().absolutePath + "/Download/" + uri.lastPathSegment
+}
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -698,7 +714,6 @@ fun StalkerArchiverMain() {
     var selectedTab by remember { mutableIntStateOf(0) }
     val tabs = listOf("Проводник .db", "Распаковка / Сборка")
 
-    // Лаунчер для выбора файла .db архива
     val archivePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
@@ -708,7 +723,6 @@ fun StalkerArchiverMain() {
         }
     }
 
-    // Лаунчер для выбора папки gamedata
     val folderPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree()
     ) { uri: Uri? ->
@@ -747,7 +761,6 @@ fun StalkerArchiverMain() {
                 .padding(horizontal = 12.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            // Поле выбора архива с кнопкой-папкой
             Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 OutlinedTextField(
                     value = archivePath,
@@ -756,12 +769,11 @@ fun StalkerArchiverMain() {
                     singleLine = true,
                     modifier = Modifier.weight(1f)
                 )
-                IconButton(onClick = { archivePickerLauncher.launch(arrayOf("*/*")) }) {
-                    Icon(Icons.Default.FolderOpen, contentDescription = "Выбрать архив")
+                OutlinedButton(onClick = { archivePickerLauncher.launch(arrayOf("*/*")) }) {
+                    Text("Файл")
                 }
             }
 
-            // Поле выбора папки gamedata с кнопкой-папкой
             Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 OutlinedTextField(
                     value = folderPath,
@@ -770,8 +782,8 @@ fun StalkerArchiverMain() {
                     singleLine = true,
                     modifier = Modifier.weight(1f)
                 )
-                IconButton(onClick = { folderPickerLauncher.launch(null) }) {
-                    Icon(Icons.Default.FolderOpen, contentDescription = "Выбрать папку")
+                OutlinedButton(onClick = { folderPickerLauncher.launch(null) }) {
+                    Text("Папка")
                 }
             }
         }
@@ -787,20 +799,6 @@ fun StalkerArchiverMain() {
             1 -> FullUnpackPackTab(archiver = archiver, archivePath = archivePath, folderPath = folderPath)
         }
     }
-}
-
-// Вспомогательная функция для конвертации Uri в стандартный путь на телефоне
-fun getFilePathFromUri(context: android.content.Context, uri: Uri): String? {
-    val path = uri.path ?: return null
-    if (path.startsWith("/external_files/")) {
-        return Environment.getExternalStorageDirectory().absolutePath + path.removePrefix("/external_files")
-    }
-    if (path.contains("/document/primary:")) {
-        val subPath = path.substringAfter("primary:")
-        return Environment.getExternalStorageDirectory().absolutePath + "/" + subPath.replace("%2F", "/")
-    }
-    if (path.startsWith("/")) return path
-    return Environment.getExternalStorageDirectory().absolutePath + "/Download/" + uri.lastPathSegment
 }
 
 @Composable
