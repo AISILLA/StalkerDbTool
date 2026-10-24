@@ -19,13 +19,6 @@ jobs:
           mkdir -p app/src/main/res/drawable
           mkdir -p app/src/main/res/mipmap-anydpi-v26
 
-          cat << 'EOF' > gradle.properties
-          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
-          android.useAndroidX=true
-          kotlin.code.style=official
-          android.nonTransitiveRClass=true
-          EOF
-
           cat << 'EOF' > settings.gradle.kts
           pluginManagement {
               repositories {
@@ -1417,10 +1410,10 @@ jobs:
           gradle-version: '8.7'
 
       - name: Build Debug APK
-        run: gradle assembleDebug
+        run: gradle :app:assembleDebug
 
       - name: Upload Compiled APK
         uses: actions/upload-artifact@v4
         with:
           name: stalker-db-tool-apk
-          path: app/build/outputs/apk/debug/app-debug.apkц
+          path: app/build/outputs/apk/debug/app-debug.apk
