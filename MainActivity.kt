@@ -56,35 +56,95 @@ data class DbFileEntry(
 )
 
 object XRayCompression {
-    private const val SBOX_SIZE = 256
 
+    /**
+     * Алгоритм снятия шифрования оглавления архивов GSC (X-Ray 1.5 / 1.6)
+     */
+    fun decryptGscHeader(src: ByteArray, seedInit: Long, mult: Long, add: Long): ByteArray {
+        val sbox = IntArray(256) { it }
+        var seed = seedInit and 0xFFFFFFFFL
+
+        for (i in 255 downTo 1) {
+            seed = (seed * mult + add) and 0xFFFFFFFFL
+            val idx = (((seed ushr 16) and 0x7FFFL) % (i + 1)).toInt()
+            val tmp = sbox[i]
+            sbox[i] = sbox[idx]
+            sbox[idx] = tmp
+        }
+
+        val invSbox = IntArray(256)
+        for (i in 0..255) {
+            invSbox[sbox[i]] = i
+        }
+
+        val dst = ByteArray(src.size)
+        var s = seed
+        for (i in src.indices) {
+            s = (s * mult + add) and 0xFFFFFFFFL
+            val key = ((s ushr 24) and 0xFFL).toInt()
+            val raw = src[i].toInt() and 0xFF
+            dst[i] = (invSbox[raw] xor key).toByte()
+        }
+        return dst
+    }
+
+    /**
+     * Автоматический подбор ключа и распаковка заголовка (Чанк 1)
+     */
     fun decodeHeaderChunk(rawChunk: ByteArray): ByteArray {
-        val candidateSizes = listOf(2 * 1024 * 1024, 8 * 1024 * 1024, 16 * 1024 * 1024, 32 * 1024 * 1024)
+        // Проверяем, не является ли заголовок уже открытым (без сжатия и шифрования)
+        if (isValidIndexHeader(rawChunk)) return rawChunk
 
-        for (size in candidateSizes) {
+        // 1. Проверяем чистый LZO1X (используется во многих модах)
+        for (candidateSize in listOf(2 * 1024 * 1024, 8 * 1024 * 1024, 16 * 1024 * 1024, 32 * 1024 * 1024)) {
             runCatching {
-                val out = decompressLzo1xSafe(rawChunk, size)
+                val out = decompressLzo1xSafe(rawChunk, candidateSize)
                 if (isValidIndexHeader(out)) return out
             }
         }
 
+        // 2. Набор оригинальных ключей GSC:
+        // [0] - Зов Припяти / Чистое Небо (configs, resources)
+        // [1] - Патчи и альтернативные сборки WW
+        // [2] - Тень Чернобыля (релизные .db)
+        val keys = listOf(
+            Triple(0x131a9d3L, 20042299L, 0x0518443bL),
+            Triple(0x01622731L, 25178309L, 0x0198812dL),
+            Triple(0x00120719L, 0x00000000L, 0x00000000L)
+        )
+
+        for ((seed, mult, add) in keys) {
+            val dec = if (mult == 0L) {
+                // Простой XOR ключ ТЧ
+                ByteArray(rawChunk.size) { i -> (rawChunk[i].toInt() xor 0x55).toByte() }
+            } else {
+                decryptGscHeader(rawChunk, seed, mult, add)
+            }
+
+            if (isValidIndexHeader(dec)) return dec
+
+            // Пробуем декомпрессию после снятия скремблера
+            if (isValidLzHuff(dec)) {
+                runCatching {
+                    val out = decompressLzHuff(dec)
+                    if (isValidIndexHeader(out)) return out
+                }
+            }
+
+            for (candidateSize in listOf(4 * 1024 * 1024, 16 * 1024 * 1024)) {
+                runCatching {
+                    val out = decompressLzo1xSafe(dec, candidateSize)
+                    if (isValidIndexHeader(out)) return out
+                }
+            }
+        }
+
+        // Если сигнатура LZHUFF без шифрования
         if (isValidLzHuff(rawChunk)) {
             runCatching {
                 val out = decompressLzHuff(rawChunk)
                 if (isValidIndexHeader(out)) return out
             }
-        }
-
-        val decRu = decryptScrambler(rawChunk, 0x131a9d3, 20042299, 0x0518443b)
-        runCatching {
-            val out = if (isValidLzHuff(decRu)) decompressLzHuff(decRu) else decompressLzo1xSafe(decRu, 8 * 1024 * 1024)
-            if (isValidIndexHeader(out)) return out
-        }
-
-        val decWw = decryptScrambler(rawChunk, 0x01622731, 25178309, 0x0198812d)
-        runCatching {
-            val out = if (isValidLzHuff(decWw)) decompressLzHuff(decWw) else decompressLzo1xSafe(decWw, 8 * 1024 * 1024)
-            if (isValidIndexHeader(out)) return out
         }
 
         return rawChunk
@@ -93,7 +153,11 @@ object XRayCompression {
     private fun isValidIndexHeader(b: ByteArray): Boolean {
         if (b.size < 18) return false
         val entrySize = (b[0].toInt() and 0xFF) or ((b[1].toInt() and 0xFF) shl 8)
-        return entrySize in 17..2048
+        if (entrySize !in 17..1024) return false
+
+        // Проверяем первый символ пути — должен быть печатным символом ASCII (буквой папки gamedata: c, s, t, m, w и т.д.)
+        val firstChar = b[16].toInt() and 0xFF
+        return firstChar in 32..126
     }
 
     private fun isValidLzHuff(data: ByteArray): Boolean {
@@ -106,32 +170,6 @@ object XRayCompression {
                 ((b[offset + 1].toInt() and 0xFF) shl 16) or
                 ((b[offset + 2].toInt() and 0xFF) shl 8) or
                 (b[offset + 3].toInt() and 0xFF)
-    }
-
-    private fun decryptScrambler(src: ByteArray, initSeed: Int, mult: Int, add: Int): ByteArray {
-        val encSbox = IntArray(SBOX_SIZE) { it }
-        val decSbox = IntArray(SBOX_SIZE)
-        var seed = initSeed
-
-        for (i in SBOX_SIZE - 1 downTo 1) {
-            seed = seed * mult + add
-            val idx = ((seed ushr 16) and 0x7FFF) % i
-            val tmp = encSbox[i]
-            encSbox[i] = encSbox[idx]
-            encSbox[idx] = tmp
-        }
-        for (i in 0 until SBOX_SIZE) {
-            decSbox[encSbox[i]] = i
-        }
-
-        val dst = ByteArray(src.size)
-        var s = seed
-        for (i in src.indices) {
-            s = s * mult + add
-            val key = (s ushr 24) and 0xFF
-            dst[i] = (decSbox[src[i].toInt() and 0xFF] xor key).toByte()
-        }
-        return dst
     }
 
     fun decompressLzHuff(src: ByteArray): ByteArray {
@@ -507,7 +545,8 @@ class XRayDbArchiver {
                     headerBytes = if (isCompressed) {
                         XRayCompression.decodeHeaderChunk(rawChunk)
                     } else {
-                        rawChunk
+                        // Даже если бит сжатия не стоит, оригинальный оглавление GSC всё равно шифрует
+                        XRayCompression.decodeHeaderChunk(rawChunk)
                     }
                     break
                 } else {
@@ -518,21 +557,26 @@ class XRayDbArchiver {
             val hdr = headerBytes ?: throw IllegalArgumentException("Чанк оглавления (ID=1) не найден")
             val buffer = ByteBuffer.wrap(hdr).order(ByteOrder.LITTLE_ENDIAN)
 
-            while (buffer.remaining() >= 2) {
+            while (buffer.remaining() >= 18) {
                 val entrySize = buffer.short.toInt() and 0xFFFF
-                if (entrySize < 16 || buffer.remaining() < entrySize) break
+                if (entrySize < 16 || buffer.remaining() < (entrySize - 2)) break
 
                 val sizeReal = buffer.int.toLong() and 0xFFFFFFFFL
                 val sizeComp = buffer.int.toLong() and 0xFFFFFFFFL
                 val crc = buffer.int.toLong() and 0xFFFFFFFFL
 
                 val nameLength = entrySize - 16
+                if (nameLength <= 0 || buffer.remaining() < (nameLength + 4)) break
+
                 val nameBytes = ByteArray(nameLength)
                 buffer.get(nameBytes)
-                val path = String(nameBytes, CP1251).replace('\\', File.separatorChar)
+                val path = String(nameBytes, CP1251).trimEnd('\u0000').replace('\\', File.separatorChar)
                 val offset = buffer.int.toLong() and 0xFFFFFFFFL
 
-                entries.add(DbFileEntry(path, sizeReal, sizeComp, crc, offset))
+                // Защита от мусорных бинарных записей
+                if (path.isNotBlank() && path.all { it.code in 32..126 || it.code in 1040..1103 || it == '/' || it == '\\' || it == '.' || it == '_' || it == '-' }) {
+                    entries.add(DbFileEntry(path, sizeReal, sizeComp, crc, offset))
+                }
             }
         }
         return entries
@@ -548,8 +592,11 @@ class XRayDbArchiver {
         outFile.parentFile?.mkdirs()
         RandomAccessFile(dbFile, "r").use { raf ->
             val data = readEntryBytes(raf, entry)
-            FileOutputStream(outFile).use { fos ->
+            val fos = FileOutputStream(outFile)
+            try {
                 fos.write(data)
+            } finally {
+                fos.close()
             }
         }
         return outFile
@@ -569,8 +616,11 @@ class XRayDbArchiver {
                 val outFile = File(outputDir, entry.relativePath)
                 outFile.parentFile?.mkdirs()
                 val data = readEntryBytes(raf, entry)
-                FileOutputStream(outFile).use { fos ->
+                val fos = FileOutputStream(outFile)
+                try {
                     fos.write(data)
+                } finally {
+                    fos.close()
                 }
             }
         }
@@ -587,8 +637,11 @@ class XRayDbArchiver {
         val outFile = File(outputDir, entry.relativePath)
         outFile.parentFile?.mkdirs()
         val normalizedText = newText.replace("\r\n", "\n").replace("\n", "\r\n")
-        FileOutputStream(outFile).use { fos ->
+        val fos = FileOutputStream(outFile)
+        try {
             fos.write(normalizedText.toByteArray(CP1251))
+        } finally {
+            fos.close()
         }
         return outFile
     }
